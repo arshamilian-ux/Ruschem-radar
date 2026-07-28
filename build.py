@@ -56,7 +56,7 @@ _EMOJI_RE = re.compile(
 
 
 def strip_emoji(s):
-    """Убрать эмодзи для PDF (Arial их не рисует). Стрелки ↑↓↗ сохраняются."""
+    """Убрать эмодзи для PDF (шрифт Arimo их не рисует). Стрелки ↑↓→▲▼ сохраняются."""
     return _EMOJI_RE.sub("", str(s)).replace("  ", " ").strip()
 
 
@@ -663,9 +663,9 @@ def build_pdf(d, path):
     from reportlab.lib.enums import TA_LEFT
 
     F = os.path.join(RADAR_DIR, "fonts") + os.sep
-    pdfmetrics.registerFont(TTFont("AR", F + "PTSans-Regular.ttf"))
-    pdfmetrics.registerFont(TTFont("AR-B", F + "PTSans-Bold.ttf"))
-    pdfmetrics.registerFont(TTFont("AR-I", F + "PTSans-Italic.ttf"))
+    pdfmetrics.registerFont(TTFont("AR", F + "Arimo-Regular.ttf"))
+    pdfmetrics.registerFont(TTFont("AR-B", F + "Arimo-Bold.ttf"))
+    pdfmetrics.registerFont(TTFont("AR-I", F + "Arimo-Italic.ttf"))
 
     def esc(s):
         s = strip_emoji(str(s))
@@ -761,7 +761,7 @@ def build_pdf(d, path):
         tagline = " · ".join(esc(x) for x in tagbits)
         if it.get("source_url"):
             tagline += (f'&nbsp;&nbsp;<a href="{urlesc(it["source_url"])}">'
-                        f'<font color="#{accent_ink.hexval()[2:]}">{esc(it.get("source_name","Источник"))} ↗</font></a>')
+                        f'<font color="#{accent_ink.hexval()[2:]}">{esc(it.get("source_name","Источник"))} →</font></a>')
         tags_p = Paragraph(tagline, S["tags"])
         content = [meta_p, title_p, why_p, tags_p]
         t = Table([[ "", content ]], colWidths=[3, avail-3])
@@ -801,7 +801,7 @@ def build_pdf(d, path):
         for b in rc.get("bullets", []):
             txt = esc(b["text"])
             if b.get("url"):
-                txt += f' <a href="{urlesc(b["url"])}"><font color="#{accent_ink.hexval()[2:]}">источник ↗</font></a>'
+                txt += f' <a href="{urlesc(b["url"])}"><font color="#{accent_ink.hexval()[2:]}">источник →</font></a>'
             story.append(Paragraph("•&nbsp; " + txt, S["rbul"]))
 
     # тренды

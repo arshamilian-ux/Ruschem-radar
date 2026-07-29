@@ -2,23 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 Рендер «Химического новостного радара» из issue.json в HTML и PDF.
-Облачная версия (Claude Code Routine) — пути относительно репозитория,
-плюс отправка готового PDF по почте. Локальная версия с путями
-~/.claude/roshim-radar и ~/Desktop/Росхим-Радар/ живёт отдельно.
+Облачная версия (Claude Code Routine) — пути относительно репозитория.
+Локальная версия с путями ~/.claude/roshim-radar и ~/Desktop/Росхим-Радар/
+живёт отдельно.
 
 Использование:
     python3 build.py [путь_к_issue.json]
 
 По умолчанию читает issue.json рядом со скриптом и кладёт результат в
 ./out/ : ДайджестРХ-<ДД-ММ-ГГГГ>.html/.pdf + ДайджестРХ-latest.html/.pdf,
-затем шлёт PDF по почте (см. send_email).
+плюс digest-email.html/.txt — контент для Gmail-черновика (см.
+write_email_draft_content). Черновик в Gmail создаёт Claude через MCP после
+запуска build.py — SMTP-доставка из скрипта не работает в облачной песочнице
+(блокирует «сырые» сокеты) и здесь не используется.
 
 Дизайн (LLM собирает данные — этот скрипт только форматирует, чтобы HTML и PDF были
 согласованы). См. config.md.
 """
-import json, os, re, sys, shutil, html, smtplib, ssl
+import json, os, re, sys, shutil, html
 from datetime import date
-from email.message import EmailMessage
 
 RADAR_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(RADAR_DIR, "out")
@@ -842,32 +844,145 @@ def build_pdf(d, path):
 # =========================================================================
 #  ПОЧТА
 # =========================================================================
-def send_email(pdf_path, ref):
-    """Отправить готовый PDF по почте (Gmail SMTP). Без переменных окружения — тихо пропускается,
-    чтобы обычный локальный прогон build.py (без почтового конфига) не ломался."""
-    addr = os.environ.get("GMAIL_ADDRESS")
-    app_pw = os.environ.get("GMAIL_APP_PASSWORD")
+# =========================================================================
+#  ПОЧТА (черновик в Gmail — без вложений, инлайн-HTML вместо PDF)
+# =========================================================================
+# Доставка PDF по SMTP отсюда не работает (облачная песочница блокирует «сырые»
+# сокеты вне HTTPS-прокси, письмо не уходит ни на один SMTP-хост). Gmail MCP-
+# коннектор умеет только create_draft, без вложений, поэтому вместо письма с PDF
+# готовим текст/HTML содержимого черновика — Claude сам создаёт черновик в Gmail
+# после build.py и ничего никуда не отправляет автоматически (отправка — вручную).
+
+def render_email_html(d, ref):
+    """Email-safe HTML: только инлайн-стили, без <style>/CSS-переменных — иначе Gmail их срежет."""
+    F = "font-family:Arial,Helvetica,sans-serif;"
+    parts = [f'<div style="{F}max-width:680px;margin:0 auto;color:#15201D;">']
+    parts.append(f'<h1 style="font-size:20px;margin:0 0 2px;">{he(DOC_TITLE)} за {he(dmy(ref))}</h1>')
+    parts.append('<p style="font-size:12px;color:#6A7874;margin:0 0 18px;">'
+                  'АО «Росхим» · Департамент международного развития</p>')
+
+    tk = d.get("ticker", [])
+    if tk:
+        cells = "".join(
+            f'<td style="padding:6px 14px 6px 0;font-size:12px;white-space:nowrap;">'
+            f'<b>{he(t["k"])}</b> {he(t["v"])} <span style="color:#6A7874;">{he(t.get("d",""))}</span></td>'
+            for t in tk)
+        parts.append(f'<table style="border-collapse:collapse;margin:0 0 18px;"><tr>{cells}</tr></table>')
+
+    for sec in d["sections"]:
+        emoji = (sec.get("emoji", "") + " ") if sec.get("emoji") else ""
+        parts.append(f'<h2 style="font-size:15px;margin:20px 0 8px;border-bottom:1px solid #DBE2DF;'
+                      f'padding-bottom:4px;">{emoji}{he(sec.get("title",""))}</h2>')
+        if not sec.get("items"):
+            parts.append('<p style="font-size:13px;color:#6A7874;font-style:italic;margin:0 0 8px;">'
+                         'Существенных событий за сутки нет.</p>')
+            continue
+        for it in sec["items"]:
+            imp = it.get("impact", "watch")
+            color = IMPACT_COLOR.get(imp, IMPACT_COLOR["watch"])
+            upd = " · Обновление" if it.get("update") else ""
+            tags = " · ".join(it.get("regions", []) + it.get("products", []))
+            src = ""
+            if it.get("source_url"):
+                src = (f'<a href="{he(it["source_url"])}" style="color:#084F49;">'
+                       f'{he(it.get("source_name","Источник"))} ↗</a>')
+            parts.append(
+                f'<div style="border-left:3px solid {color};padding:6px 0 6px 12px;margin:0 0 12px;">'
+                f'<div style="font-size:11px;color:{color};font-weight:bold;text-transform:uppercase;">'
+                f'{he(it.get("impact_label",""))}{he(upd)}</div>'
+                f'<div style="font-weight:bold;font-size:14px;margin:3px 0;">{he(it.get("title",""))}</div>'
+                f'<div style="font-size:13px;color:#3C4945;margin:0 0 4px;">{he(it.get("why",""))}</div>'
+                f'<div style="font-size:11px;color:#6A7874;">{src}{" · " if src and tags else ""}{he(tags)}</div>'
+                f'</div>')
+
+    rcards = d.get("regions_cards", [])
+    if rcards:
+        parts.append('<h2 style="font-size:15px;margin:20px 0 8px;border-bottom:1px solid #DBE2DF;'
+                      'padding-bottom:4px;">📍 Новости по регионам</h2>')
+        for rc in rcards:
+            if not rc.get("bullets"):
+                continue
+            parts.append(f'<div style="margin:0 0 10px;"><b style="font-size:13px;">{he(rc["name"])}</b>'
+                         '<ul style="margin:4px 0 0;padding-left:18px;font-size:13px;color:#3C4945;">')
+            for b in rc["bullets"]:
+                url = (f' <a href="{he(b["url"])}" style="color:#084F49;">источник</a>'
+                       if b.get("url") else "")
+                parts.append(f'<li style="margin:0 0 4px;">{he(b["text"])}{url}</li>')
+            parts.append('</ul></div>')
+
+    tr = d.get("trends", {})
+    if tr.get("points"):
+        parts.append(f'<h2 style="font-size:15px;margin:20px 0 8px;border-bottom:1px solid #DBE2DF;'
+                      f'padding-bottom:4px;">📈 Тренды мировой химотрасли за месяц</h2>'
+                      f'<p style="font-size:11px;color:#6A7874;margin:0 0 8px;">{he(tr.get("updated",""))}</p>')
+        for p in tr["points"]:
+            parts.append(f'<div style="margin:0 0 10px;"><b style="font-size:13px;">{he(p["title"])}</b>'
+                         f'<p style="font-size:13px;color:#3C4945;margin:3px 0 0;">{he(p["text"])}</p></div>')
+
+    parts.append('<p style="font-size:11px;color:#6A7874;margin:24px 0 0;border-top:1px solid #DBE2DF;'
+                  'padding-top:10px;">Автосводка по открытым источникам · для внутреннего пользования · '
+                  'полная PDF/HTML-версия — в архиве репозитория.</p>')
+    parts.append('</div>')
+    return "".join(parts)
+
+
+def render_email_text(d, ref):
+    """Плоский текст — используется как plain-text альтернатива HTML-черновика."""
+    lines = [f'{DOC_TITLE} за {dmy(ref)}', 'АО «Росхим» · Департамент международного развития', '']
+    tk = d.get("ticker", [])
+    if tk:
+        lines.append(" | ".join(f'{t["k"]}: {t["v"]} ({t.get("d","")})' for t in tk))
+        lines.append("")
+    for sec in d["sections"]:
+        lines.append(f'== {sec.get("title","")} ==')
+        if not sec.get("items"):
+            lines.append("Существенных событий за сутки нет.")
+        for it in sec.get("items", []):
+            upd = " [Обновление]" if it.get("update") else ""
+            lines.append(f'[{it.get("impact_label","")}]{upd} {it.get("title","")}')
+            lines.append(f'  {it.get("why","")}')
+            if it.get("source_url"):
+                lines.append(f'  Источник: {it.get("source_name","")} — {it["source_url"]}')
+        lines.append("")
+    rcards = [rc for rc in d.get("regions_cards", []) if rc.get("bullets")]
+    if rcards:
+        lines.append("== Новости по регионам ==")
+        for rc in rcards:
+            lines.append(f'{rc["name"]}:')
+            for b in rc["bullets"]:
+                suffix = f' ({b["url"]})' if b.get("url") else ""
+                lines.append(f'  - {b["text"]}{suffix}')
+        lines.append("")
+    tr = d.get("trends", {})
+    if tr.get("points"):
+        lines.append(f'== Тренды мировой химотрасли за месяц ({tr.get("updated","")}) ==')
+        for p in tr["points"]:
+            lines.append(f'{p["title"]}: {p["text"]}')
+    return "\n".join(lines)
+
+
+def write_email_draft_content(d, ref, out_dir):
+    """Пишет email.html/email.txt в out/ — Claude использует их как body/htmlBody для
+    mcp__Gmail__create_draft. Само письмо build.py не отправляет и не создаёт черновик —
+    только готовит контент, потому что MCP-инструменты доступны лишь агенту, не скрипту."""
+    html_path = os.path.join(out_dir, "digest-email.html")
+    txt_path = os.path.join(out_dir, "digest-email.txt")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(render_email_html(d, ref))
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(render_email_text(d, ref))
+
     recipients_raw = os.environ.get("DIGEST_RECIPIENTS")
-    if not (addr and app_pw and recipients_raw):
-        print("⚠ Почта не отправлена: не заданы GMAIL_ADDRESS / GMAIL_APP_PASSWORD / DIGEST_RECIPIENTS")
+    if not recipients_raw:
+        print("⚠ Черновик не создан: не задан DIGEST_RECIPIENTS. Контент готов в "
+              f"{txt_path} / {html_path} — создай Gmail-черновик вручную через MCP.")
         return
     recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
-
-    msg = EmailMessage()
-    msg["Subject"] = f"Дайджест ключевых новостей за {dmy(ref)}"
-    msg["From"] = addr
-    msg["To"] = ", ".join(recipients)
-    msg.set_content("Дайджест ключевых новостей химотрасли — во вложении (PDF).")
-
-    with open(pdf_path, "rb") as f:
-        msg.add_attachment(f.read(), maintype="application", subtype="pdf",
-                            filename=os.path.basename(pdf_path))
-
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
-        s.login(addr, app_pw)
-        s.send_message(msg)
-    print(f"Письмо отправлено: {', '.join(recipients)}")
+    print(f"✎ Контент черновика готов: {html_path} / {txt_path}")
+    print(f"  Тема: Дайджест ключевых новостей за {dmy(ref)}")
+    print(f"  Кому: {', '.join(recipients)}")
+    print("  Claude создаёт черновик в Gmail (mcp__Gmail__create_draft) из этого содержимого — "
+          "письмо остаётся в черновиках, отправка вручную.")
 
 
 # =========================================================================
@@ -950,7 +1065,7 @@ def main():
     print("LATEST:", os.path.join(OUT_DIR, f"{FILE_PREFIX}-latest.pdf"))
     print(f"Журнал: +{added} строк в history.jsonl")
 
-    send_email(pdf_path, ref)
+    write_email_draft_content(d, ref, OUT_DIR)
 
 
 if __name__ == "__main__":

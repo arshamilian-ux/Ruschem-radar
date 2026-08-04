@@ -10,16 +10,17 @@
     python3 build.py [путь_к_issue.json]
 
 По умолчанию читает issue.json рядом со скриптом и кладёт результат в
-./out/ : ДайджестРХ-<ДД-ММ-ГГГГ>.html/.pdf + ДайджестРХ-latest.html/.pdf,
-плюс digest-email.html/.txt — контент для Gmail-черновика (см.
-write_email_draft_content). Черновик в Gmail создаёт Claude через MCP после
-запуска build.py — SMTP-доставка из скрипта не работает в облачной песочнице
-(блокирует «сырые» сокеты) и здесь не используется.
+./out/ : ДайджестРХ-<ДД-ММ-ГГГГ>.html/.pdf + ДайджестРХ-latest.html/.pdf.
+Готовый выпуск скрипт сам публикует в закрытый Telegram-канал (см.
+send_to_telegram): PDF-файлом плюс короткая сводка со ссылками. Почтовая
+рассылка отменена — Gmail-коннектор не умеет вложений, а SMTP из облачной
+песочницы не работает вовсе (блокируются «сырые» сокеты вне HTTPS-прокси).
 
 Дизайн (LLM собирает данные — этот скрипт только форматирует, чтобы HTML и PDF были
 согласованы). См. config.md.
 """
-import json, os, re, sys, shutil, html
+import json, os, re, sys, shutil, html, time
+import urllib.request, urllib.parse, urllib.error
 from datetime import date
 
 RADAR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -842,147 +843,207 @@ def build_pdf(d, path):
 
 
 # =========================================================================
-#  ПОЧТА
+#  ДОСТАВКА — закрытый Telegram-канал
 # =========================================================================
-# =========================================================================
-#  ПОЧТА (черновик в Gmail — без вложений, инлайн-HTML вместо PDF)
-# =========================================================================
-# Доставка PDF по SMTP отсюда не работает (облачная песочница блокирует «сырые»
-# сокеты вне HTTPS-прокси, письмо не уходит ни на один SMTP-хост). Gmail MCP-
-# коннектор умеет только create_draft, без вложений, поэтому вместо письма с PDF
-# готовим текст/HTML содержимого черновика — Claude сам создаёт черновик в Gmail
-# после build.py и ничего никуда не отправляет автоматически (отправка — вручную).
+# Единственный канал доставки. Бот публикует PDF файлом и следом короткую
+# сводку со ссылками. Почта отменена: Gmail-коннектор не умеет вложений, так что
+# PDF до получателей не доходил вовсе, а SMTP из облачной песочницы не работает
+# (блокируются «сырые» сокеты вне HTTPS-прокси). Bot API — обычный HTTPS и идёт
+# через тот же прокси, что и остальной трафик.
+#
+# Нужны две переменные окружения: TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.
+# Если их нет — выпуск всё равно собирается, публикация просто пропускается.
 
-def render_email_html(d, ref):
-    """Email-safe HTML: только инлайн-стили, без <style>/CSS-переменных — иначе Gmail их срежет."""
-    F = "font-family:Arial,Helvetica,sans-serif;"
-    parts = [f'<div style="{F}max-width:680px;margin:0 auto;color:#15201D;">']
-    parts.append(f'<h1 style="font-size:20px;margin:0 0 2px;">{he(DOC_TITLE)} за {he(dmy(ref))}</h1>')
-    parts.append('<p style="font-size:12px;color:#6A7874;margin:0 0 18px;">'
-                  'АО «Росхим» · Департамент международного развития</p>')
+TG_API = "https://api.telegram.org"
+TG_CAPTION_LIMIT = 1024      # лимит подписи к документу
+TG_MESSAGE_LIMIT = 4096      # лимит одного текстового сообщения
+TG_ATTEMPTS = 3              # попыток на вызов, с нарастающей паузой
 
+
+def tg_esc(s):
+    """Экранирование под parse_mode=HTML: Telegram понимает только & < >."""
+    return html.escape(str(s or ""), quote=False)
+
+
+def _tg_call(token, method, fields=None, file_field=None, file_path=None, timeout=90):
+    """Один вызов Bot API. Возвращает (ok, result | текст ошибки)."""
+    url = f"{TG_API}/bot{token}/{method}"
+    fields = {k: str(v) for k, v in (fields or {}).items()}
+
+    if file_path:
+        boundary = "----radar" + os.urandom(12).hex()
+        body = bytearray()
+        for k, v in fields.items():
+            body += (f"--{boundary}\r\n"
+                     f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+                     f"{v}\r\n").encode("utf-8")
+        with open(file_path, "rb") as f:
+            blob = f.read()
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{file_field}"; '
+                 f'filename="{os.path.basename(file_path)}"\r\n'
+                 f"Content-Type: application/pdf\r\n\r\n").encode("utf-8")
+        body += blob + b"\r\n" + f"--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(url, data=bytes(body))
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    else:
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode("utf-8"))
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+    return (True, payload.get("result")) if payload.get("ok") \
+        else (False, payload.get("description", "неизвестная ошибка Bot API"))
+
+
+def _tg_call_retry(token, method, **kw):
+    """То же, но с повторами: сетевой сбой не должен стоить выпуска."""
+    ok, res = False, "не выполнено"
+    for i in range(TG_ATTEMPTS):
+        ok, res = _tg_call(token, method, **kw)
+        if ok:
+            return True, res
+        if i < TG_ATTEMPTS - 1:
+            time.sleep(2 ** i)
+    return False, res
+
+
+def _tg_resolve_chat(token, raw):
+    """Проверяет доступность чата. У приватных каналов настоящий id начинается
+    на -100, а web.telegram.org в адресной строке этот префикс теряет — если
+    id как есть не открывается, пробуем восстановить префикс.
+    Возвращает (chat_id, чат, предупреждение) либо (None, None, причина)."""
+    ok, res = _tg_call(token, "getChat", fields={"chat_id": raw})
+    if ok:
+        return raw, res, None
+    first_err = res
+    if re.fullmatch(r"-\d{9,11}", raw):
+        fixed = "-100" + raw.lstrip("-")
+        ok2, res2 = _tg_call(token, "getChat", fields={"chat_id": fixed})
+        if ok2:
+            return fixed, res2, (
+                f"TELEGRAM_CHAT_ID={raw} — это id приватного канала без префикса «100»; "
+                f"публикую в {fixed}. Поправь переменную, чтобы предупреждение ушло.")
+    return None, None, first_err
+
+
+def render_tg_caption(d, ref):
+    """Подпись к PDF: шапка и строка тикера, ужатая под лимит подписи."""
+    head = (f"<b>{tg_esc(DOC_TITLE)} за {tg_esc(dmy(ref))}</b>\n"
+            "АО «Росхим» · Департамент международного развития")
     tk = d.get("ticker", [])
-    if tk:
-        cells = "".join(
-            f'<td style="padding:6px 14px 6px 0;font-size:12px;white-space:nowrap;">'
-            f'<b>{he(t["k"])}</b> {he(t["v"])} <span style="color:#6A7874;">{he(t.get("d",""))}</span></td>'
-            for t in tk)
-        parts.append(f'<table style="border-collapse:collapse;margin:0 0 18px;"><tr>{cells}</tr></table>')
+    if not tk:
+        return head
+    line = " · ".join(" ".join(x for x in (t["k"], t["v"], t.get("d", "")) if x) for t in tk)
+    cap = f"{head}\n\n{tg_esc(line)}"
+    while len(cap) > TG_CAPTION_LIMIT and line:
+        line = line[:-8].rstrip(" ·")
+        cap = f"{head}\n\n{tg_esc(line)}…"
+    return cap
 
+
+def render_tg_messages(d, ref):
+    """Сводка со ссылками, порезанная на сообщения по лимиту Telegram.
+    Полный текст выпуска сюда не идёт — он в PDF; здесь только заголовки."""
+    blocks = []
     for sec in d["sections"]:
-        emoji = (sec.get("emoji", "") + " ") if sec.get("emoji") else ""
-        parts.append(f'<h2 style="font-size:15px;margin:20px 0 8px;border-bottom:1px solid #DBE2DF;'
-                      f'padding-bottom:4px;">{emoji}{he(sec.get("title",""))}</h2>')
-        if not sec.get("items"):
-            parts.append('<p style="font-size:13px;color:#6A7874;font-style:italic;margin:0 0 8px;">'
-                         'Существенных событий за сутки нет.</p>')
+        items = sec.get("items") or []
+        if not items:
             continue
-        for it in sec["items"]:
-            imp = it.get("impact", "watch")
-            color = IMPACT_COLOR.get(imp, IMPACT_COLOR["watch"])
-            upd = " · Обновление" if it.get("update") else ""
-            tags = " · ".join(it.get("regions", []) + it.get("products", []))
-            src = ""
-            if it.get("source_url"):
-                src = (f'<a href="{he(it["source_url"])}" style="color:#084F49;">'
-                       f'{he(it.get("source_name","Источник"))} ↗</a>')
-            parts.append(
-                f'<div style="border-left:3px solid {color};padding:6px 0 6px 12px;margin:0 0 12px;">'
-                f'<div style="font-size:11px;color:{color};font-weight:bold;text-transform:uppercase;">'
-                f'{he(it.get("impact_label",""))}{he(upd)}</div>'
-                f'<div style="font-weight:bold;font-size:14px;margin:3px 0;">{he(it.get("title",""))}</div>'
-                f'<div style="font-size:13px;color:#3C4945;margin:0 0 4px;">{he(it.get("why",""))}</div>'
-                f'<div style="font-size:11px;color:#6A7874;">{src}{" · " if src and tags else ""}{he(tags)}</div>'
-                f'</div>')
+        emoji = (sec.get("emoji", "") + " ") if sec.get("emoji") else ""
+        lines = [f'{emoji}<b>{tg_esc(sec.get("title", ""))}</b>']
+        for it in items:
+            upd = " · обновление" if it.get("update") else ""
+            title = tg_esc(it.get("title", ""))
+            url = it.get("source_url")
+            body = f'<a href="{tg_esc(url)}">{title}</a>' if url else title
+            lines.append(f"• {body}{tg_esc(upd)}")
+        blocks.append("\n".join(lines))
 
-    rcards = d.get("regions_cards", [])
-    if rcards:
-        parts.append('<h2 style="font-size:15px;margin:20px 0 8px;border-bottom:1px solid #DBE2DF;'
-                      'padding-bottom:4px;">📍 Новости по регионам</h2>')
-        for rc in rcards:
-            if not rc.get("bullets"):
-                continue
-            parts.append(f'<div style="margin:0 0 10px;"><b style="font-size:13px;">{he(rc["name"])}</b>'
-                         '<ul style="margin:4px 0 0;padding-left:18px;font-size:13px;color:#3C4945;">')
-            for b in rc["bullets"]:
-                url = (f' <a href="{he(b["url"])}" style="color:#084F49;">источник</a>'
-                       if b.get("url") else "")
-                parts.append(f'<li style="margin:0 0 4px;">{he(b["text"])}{url}</li>')
-            parts.append('</ul></div>')
+    empty = [s.get("title", s["id"]) for s in d["sections"] if not s.get("items")]
+    if empty:
+        blocks.append(f'<i>Без событий за сутки: {tg_esc(", ".join(empty))}.</i>')
 
-    tr = d.get("trends", {})
-    if tr.get("points"):
-        parts.append(f'<h2 style="font-size:15px;margin:20px 0 8px;border-bottom:1px solid #DBE2DF;'
-                      f'padding-bottom:4px;">📈 Тренды мировой химотрасли за месяц</h2>'
-                      f'<p style="font-size:11px;color:#6A7874;margin:0 0 8px;">{he(tr.get("updated",""))}</p>')
-        for p in tr["points"]:
-            parts.append(f'<div style="margin:0 0 10px;"><b style="font-size:13px;">{he(p["title"])}</b>'
-                         f'<p style="font-size:13px;color:#3C4945;margin:3px 0 0;">{he(p["text"])}</p></div>')
+    def _fit(block):
+        """Блок, который сам не влезает в сообщение, режем по строкам."""
+        if len(block) <= TG_MESSAGE_LIMIT:
+            return [block]
+        out, buf = [], ""
+        for ln in block.split("\n"):
+            ln = ln[:TG_MESSAGE_LIMIT]
+            if buf and len(buf) + 1 + len(ln) > TG_MESSAGE_LIMIT:
+                out.append(buf)
+                buf = ln
+            else:
+                buf = f"{buf}\n{ln}" if buf else ln
+        if buf:
+            out.append(buf)
+        return out
 
-    parts.append('<p style="font-size:11px;color:#6A7874;margin:24px 0 0;border-top:1px solid #DBE2DF;'
-                  'padding-top:10px;">Автосводка по открытым источникам · для внутреннего пользования · '
-                  'полная PDF/HTML-версия — в архиве репозитория.</p>')
-    parts.append('</div>')
-    return "".join(parts)
+    msgs, cur = [], ""
+    for block in [b for blk in blocks for b in _fit(blk)]:
+        if not cur:
+            cur = block
+        elif len(cur) + 2 + len(block) <= TG_MESSAGE_LIMIT:
+            cur += "\n\n" + block
+        else:
+            msgs.append(cur)
+            cur = block
+    if cur:
+        msgs.append(cur)
+    return msgs
 
 
-def render_email_text(d, ref):
-    """Плоский текст — используется как plain-text альтернатива HTML-черновика."""
-    lines = [f'{DOC_TITLE} за {dmy(ref)}', 'АО «Росхим» · Департамент международного развития', '']
-    tk = d.get("ticker", [])
-    if tk:
-        lines.append(" | ".join(f'{t["k"]}: {t["v"]} ({t.get("d","")})' for t in tk))
-        lines.append("")
-    for sec in d["sections"]:
-        lines.append(f'== {sec.get("title","")} ==')
-        if not sec.get("items"):
-            lines.append("Существенных событий за сутки нет.")
-        for it in sec.get("items", []):
-            upd = " [Обновление]" if it.get("update") else ""
-            lines.append(f'[{it.get("impact_label","")}]{upd} {it.get("title","")}')
-            lines.append(f'  {it.get("why","")}')
-            if it.get("source_url"):
-                lines.append(f'  Источник: {it.get("source_name","")} — {it["source_url"]}')
-        lines.append("")
-    rcards = [rc for rc in d.get("regions_cards", []) if rc.get("bullets")]
-    if rcards:
-        lines.append("== Новости по регионам ==")
-        for rc in rcards:
-            lines.append(f'{rc["name"]}:')
-            for b in rc["bullets"]:
-                suffix = f' ({b["url"]})' if b.get("url") else ""
-                lines.append(f'  - {b["text"]}{suffix}')
-        lines.append("")
-    tr = d.get("trends", {})
-    if tr.get("points"):
-        lines.append(f'== Тренды мировой химотрасли за месяц ({tr.get("updated","")}) ==')
-        for p in tr["points"]:
-            lines.append(f'{p["title"]}: {p["text"]}')
-    return "\n".join(lines)
+def send_to_telegram(d, ref, pdf_path):
+    """Публикует выпуск в канал. Возвращает True, если ушло всё."""
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    raw_chat = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if not token or not raw_chat:
+        missing = ", ".join(n for n, v in (("TELEGRAM_BOT_TOKEN", token),
+                                           ("TELEGRAM_CHAT_ID", raw_chat)) if not v)
+        print(f"⚠ Публикация в Telegram пропущена: не заданы {missing}.")
+        print(f"  Выпуск собран, файлы в {OUT_DIR} — разошли вручную.")
+        return False
 
+    chat_id, chat, note = _tg_resolve_chat(token, raw_chat)
+    if chat_id is None:
+        print(f"✗ Telegram: канал недоступен — {note}")
+        print("  Проверь TELEGRAM_CHAT_ID и что бот добавлен в канал администратором.")
+        return False
+    if note:
+        print(f"⚠ {note}")
+    where = (chat or {}).get("title") or chat_id
 
-def write_email_draft_content(d, ref, out_dir):
-    """Пишет email.html/email.txt в out/ — Claude использует их как body/htmlBody для
-    mcp__Gmail__create_draft. Само письмо build.py не отправляет и не создаёт черновик —
-    только готовит контент, потому что MCP-инструменты доступны лишь агенту, не скрипту."""
-    html_path = os.path.join(out_dir, "digest-email.html")
-    txt_path = os.path.join(out_dir, "digest-email.txt")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(render_email_html(d, ref))
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(render_email_text(d, ref))
+    ok, res = _tg_call_retry(token, "sendDocument",
+                             fields={"chat_id": chat_id,
+                                     "caption": render_tg_caption(d, ref),
+                                     "parse_mode": "HTML"},
+                             file_field="document", file_path=pdf_path)
+    if not ok:
+        print(f"✗ Telegram: PDF не отправлен — {res}")
+        return False
+    print(f"✈ Telegram: PDF опубликован в «{where}»")
 
-    recipients_raw = os.environ.get("DIGEST_RECIPIENTS")
-    if not recipients_raw:
-        print("⚠ Черновик не создан: не задан DIGEST_RECIPIENTS. Контент готов в "
-              f"{txt_path} / {html_path} — создай Gmail-черновик вручную через MCP.")
-        return
-    recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
-    print(f"✎ Контент черновика готов: {html_path} / {txt_path}")
-    print(f"  Тема: Дайджест ключевых новостей за {dmy(ref)}")
-    print(f"  Кому: {', '.join(recipients)}")
-    print("  Claude создаёт черновик в Gmail (mcp__Gmail__create_draft) из этого содержимого — "
-          "письмо остаётся в черновиках, отправка вручную.")
+    msgs = render_tg_messages(d, ref)
+    for n, chunk in enumerate(msgs, 1):
+        ok, res = _tg_call_retry(token, "sendMessage",
+                                 fields={"chat_id": chat_id, "text": chunk,
+                                         "parse_mode": "HTML",
+                                         "disable_web_page_preview": "true"})
+        if not ok:
+            print(f"✗ Telegram: сводка не отправлена (сообщение {n} из {len(msgs)}) — {res}")
+            print("  PDF при этом уже в канале.")
+            return False
+    print(f"✈ Telegram: сводка опубликована ({len(msgs)} сообщ.)")
+    return True
 
 
 # =========================================================================
@@ -1065,7 +1126,7 @@ def main():
     print("LATEST:", os.path.join(OUT_DIR, f"{FILE_PREFIX}-latest.pdf"))
     print(f"Журнал: +{added} строк в history.jsonl")
 
-    write_email_draft_content(d, ref, OUT_DIR)
+    send_to_telegram(d, ref, pdf_path)
 
 
 if __name__ == "__main__":

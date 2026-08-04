@@ -845,8 +845,10 @@ def build_pdf(d, path):
 # =========================================================================
 #  ДОСТАВКА — закрытый Telegram-канал
 # =========================================================================
-# Единственный канал доставки. Бот публикует PDF файлом и следом короткую
-# сводку со ссылками. Почта отменена: Gmail-коннектор не умеет вложений, так что
+# Единственный канал доставки. Один выпуск — один пост: PDF файлом, а подписью
+# к нему шапка, таблица тикера и аннотация. Всё это обязано уложиться в лимит
+# подписи (1024 символа), поэтому заголовки пунктов в пост не идут — они в PDF.
+# Почта отменена: Gmail-коннектор не умеет вложений, так что
 # PDF до получателей не доходил вовсе, а SMTP из облачной песочницы не работает
 # (блокируются «сырые» сокеты вне HTTPS-прокси). Bot API — обычный HTTPS и идёт
 # через тот же прокси, что и остальной трафик.
@@ -855,9 +857,9 @@ def build_pdf(d, path):
 # Если их нет — выпуск всё равно собирается, публикация просто пропускается.
 
 TG_API = "https://api.telegram.org"
-TG_CAPTION_LIMIT = 1024      # лимит подписи к документу
-TG_MESSAGE_LIMIT = 4096      # лимит одного текстового сообщения
+TG_CAPTION_LIMIT = 1024      # лимит подписи к документу — он же лимит всего поста
 TG_ATTEMPTS = 3              # попыток на вызов, с нарастающей паузой
+TG_DIR_CHARS = "▲▼→↑↓↔"     # стрелки, которыми агент открывает подпись значения
 
 
 def tg_esc(s):
@@ -935,71 +937,62 @@ def _tg_resolve_chat(token, raw):
     return None, None, first_err
 
 
+def _tg_visible_len(s):
+    """Длина, которую считает Telegram: разметка в лимит подписи не входит."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", s)))
+
+
+def _tg_glyph(t):
+    """Стрелку берём из подписи d, которую написал агент: она описывает движение
+    самого значения. Поле dir для этого не годится — оно про стресс/риск
+    (падение трафика в проливе — это dir=up), и стрелка из него соврёт."""
+    d = str(t.get("d", "")).strip()
+    return d[0] if d[:1] in TG_DIR_CHARS else " "
+
+
+def render_tg_table(tk):
+    """Тикер моноширинной таблицей: <pre> — единственный блок, в котором
+    Telegram сохраняет выравнивание. Держим две колонки и узкую строку, иначе
+    на телефоне таблица уедет в горизонтальную прокрутку.
+    Развёрнутая подпись значения (поле d) сюда не идёт — она в PDF."""
+    rows = [(str(t.get("k", "")), f'{_tg_glyph(t)} {t.get("v", "")}') for t in tk]
+    w = max(len(k) for k, _ in rows)
+    body = "\n".join(f"{k.ljust(w)}  {v}" for k, v in rows)
+    return f"<pre>{tg_esc(body)}</pre>"
+
+
+def _fallback_annotation(d):
+    """Если агент не написал annotation — честно перечисляем состав выпуска,
+    а не имитируем связный текст из заголовков."""
+    parts = [f'{s.get("title", s["id"])} — {len(s.get("items") or [])}' for s in d["sections"]]
+    return "Состав выпуска: " + "; ".join(parts) + "."
+
+
 def render_tg_caption(d, ref):
-    """Подпись к PDF: шапка и строка тикера, ужатая под лимит подписи."""
+    """Подпись к PDF — это и есть всё сообщение: шапка, таблица тикера и
+    аннотация. Один выпуск = один пост, поэтому всё обязано уложиться
+    в лимит подписи; при нехватке места режется только аннотация."""
     head = (f"<b>{tg_esc(DOC_TITLE)} за {tg_esc(dmy(ref))}</b>\n"
             "АО «Росхим» · Департамент международного развития")
-    tk = d.get("ticker", [])
-    if not tk:
-        return head
-    line = " · ".join(" ".join(x for x in (t["k"], t["v"], t.get("d", "")) if x) for t in tk)
-    cap = f"{head}\n\n{tg_esc(line)}"
-    while len(cap) > TG_CAPTION_LIMIT and line:
-        line = line[:-8].rstrip(" ·")
-        cap = f"{head}\n\n{tg_esc(line)}…"
-    return cap
+    parts = [head]
+    tk = d.get("ticker") or []
+    if tk:
+        parts.append(render_tg_table(tk))
 
-
-def render_tg_messages(d, ref):
-    """Сводка со ссылками, порезанная на сообщения по лимиту Telegram.
-    Полный текст выпуска сюда не идёт — он в PDF; здесь только заголовки."""
-    blocks = []
-    for sec in d["sections"]:
-        items = sec.get("items") or []
-        if not items:
-            continue
-        emoji = (sec.get("emoji", "") + " ") if sec.get("emoji") else ""
-        lines = [f'{emoji}<b>{tg_esc(sec.get("title", ""))}</b>']
-        for it in items:
-            upd = " · обновление" if it.get("update") else ""
-            title = tg_esc(it.get("title", ""))
-            url = it.get("source_url")
-            body = f'<a href="{tg_esc(url)}">{title}</a>' if url else title
-            lines.append(f"• {body}{tg_esc(upd)}")
-        blocks.append("\n".join(lines))
-
-    empty = [s.get("title", s["id"]) for s in d["sections"] if not s.get("items")]
-    if empty:
-        blocks.append(f'<i>Без событий за сутки: {tg_esc(", ".join(empty))}.</i>')
-
-    def _fit(block):
-        """Блок, который сам не влезает в сообщение, режем по строкам."""
-        if len(block) <= TG_MESSAGE_LIMIT:
-            return [block]
-        out, buf = [], ""
-        for ln in block.split("\n"):
-            ln = ln[:TG_MESSAGE_LIMIT]
-            if buf and len(buf) + 1 + len(ln) > TG_MESSAGE_LIMIT:
-                out.append(buf)
-                buf = ln
-            else:
-                buf = f"{buf}\n{ln}" if buf else ln
-        if buf:
-            out.append(buf)
-        return out
-
-    msgs, cur = [], ""
-    for block in [b for blk in blocks for b in _fit(blk)]:
-        if not cur:
-            cur = block
-        elif len(cur) + 2 + len(block) <= TG_MESSAGE_LIMIT:
-            cur += "\n\n" + block
-        else:
-            msgs.append(cur)
-            cur = block
-    if cur:
-        msgs.append(cur)
-    return msgs
+    ann = str(d.get("annotation") or "").strip() or _fallback_annotation(d)
+    fixed = "\n\n".join(parts)
+    room = TG_CAPTION_LIMIT - _tg_visible_len(fixed) - 2
+    if room <= 0:
+        return fixed
+    if len(ann) > room:
+        words, cut = ann.split(), ""
+        while words:
+            words.pop()
+            cut = " ".join(words).rstrip(" ,.;:—-") + "…"
+            if len(cut) <= room:
+                break
+        ann = cut
+    return f"{fixed}\n\n{tg_esc(ann)}"
 
 
 def send_to_telegram(d, ref, pdf_path):
@@ -1022,27 +1015,20 @@ def send_to_telegram(d, ref, pdf_path):
         print(f"⚠ {note}")
     where = (chat or {}).get("title") or chat_id
 
+    if not str(d.get("annotation") or "").strip():
+        print("⚠ В issue.json нет поля annotation — в пост уйдёт сухой перечень состава "
+              "выпуска. Напиши аннотацию: 2–4 предложения о главном за сутки.")
+
+    caption = render_tg_caption(d, ref)
     ok, res = _tg_call_retry(token, "sendDocument",
-                             fields={"chat_id": chat_id,
-                                     "caption": render_tg_caption(d, ref),
+                             fields={"chat_id": chat_id, "caption": caption,
                                      "parse_mode": "HTML"},
                              file_field="document", file_path=pdf_path)
     if not ok:
-        print(f"✗ Telegram: PDF не отправлен — {res}")
+        print(f"✗ Telegram: выпуск не опубликован — {res}")
         return False
-    print(f"✈ Telegram: PDF опубликован в «{where}»")
-
-    msgs = render_tg_messages(d, ref)
-    for n, chunk in enumerate(msgs, 1):
-        ok, res = _tg_call_retry(token, "sendMessage",
-                                 fields={"chat_id": chat_id, "text": chunk,
-                                         "parse_mode": "HTML",
-                                         "disable_web_page_preview": "true"})
-        if not ok:
-            print(f"✗ Telegram: сводка не отправлена (сообщение {n} из {len(msgs)}) — {res}")
-            print("  PDF при этом уже в канале.")
-            return False
-    print(f"✈ Telegram: сводка опубликована ({len(msgs)} сообщ.)")
+    print(f"✈ Telegram: выпуск опубликован в «{where}» "
+          f"(подпись {_tg_visible_len(caption)}/{TG_CAPTION_LIMIT})")
     return True
 
 

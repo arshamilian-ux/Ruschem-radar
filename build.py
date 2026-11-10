@@ -961,6 +961,39 @@ def render_tg_table(tk):
     return f"<pre>{tg_esc(body)}</pre>"
 
 
+# Аннотация — текст для читателей канала. Служебные пометки о ходе сборки
+# («источники недоступны», «выпуск в ограниченном режиме» и т.п.) ей не место:
+# они идут в резюме прогона. Код вырезает такие предложения сам, чтобы
+# приписка не ушла в канал, даже если агент её написал.
+SERVICE_NOTE_RE = re.compile(
+    r"ограниченн\w*\s+(режим|доступ)"
+    r"|доступ\w*\s+к\s+(\w+\s+){0,2}источник"
+    r"|(источник|сайт|ресурс)\w*[^.!?…]{0,60}недоступн"
+    r"|недоступн\w*[^.!?…]{0,60}(источник|сайт)"
+    r"|облачн\w+\s+сесси"
+    r"|(выпуск|дайджест)\w*[^.!?…]{0,30}(сокращ|урезан)"
+    r"|провер\w+\s+(по\s+)?дат",
+    re.IGNORECASE,
+)
+
+
+def strip_service_notes(text):
+    """Возвращает (очищенная аннотация, список вырезанных предложений)."""
+    sents = re.split(r"(?<=[.!?…])\s+", str(text or "").strip())
+    keep, cut = [], []
+    for s in sents:
+        if not s or not SERVICE_NOTE_RE.search(s):
+            keep.append(s)
+            continue
+        # «Новость; из-за недоступности источников…» — новость оставляем
+        parts = [p.strip() for p in s.split(";")]
+        good = [p for p in parts if p and not SERVICE_NOTE_RE.search(p)]
+        if good:
+            keep.append("; ".join(good).rstrip(" ,.;:—-") + ".")
+        cut.append(s)
+    return " ".join(x for x in keep if x).strip(), cut
+
+
 def _fallback_annotation(d):
     """Если агент не написал annotation — честно перечисляем состав выпуска,
     а не имитируем связный текст из заголовков."""
@@ -1072,7 +1105,15 @@ def main():
     for w in warns:
         print(f"⚠ {w}")
 
-    total = sum(len(s["items"]) for s in d["sections"])
+    ann, cut = strip_service_notes(d.get("annotation"))
+    if cut:
+        d["annotation"] = ann
+        print("⚠ Из аннотации вырезаны служебные пометки о сборке "
+              "(им место в резюме прогона, а не в посте):")
+        for s in cut:
+            print(f"   · {s}")
+
+    total =sum(len(s["items"]) for s in d["sections"])
     empty = [s["id"] for s in d["sections"] if not s["items"]]
     print("Рубрики: " + ", ".join(f"{s['id']}={len(s['items'])}" for s in d["sections"])
           + f"  ·  всего {total}")
